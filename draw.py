@@ -45,7 +45,7 @@ def generate_gif_from_pics(
     # Load each file, resize if necessary, and append to images list
     for file_name in file_names:
         with Image.open(file_name) as img:
-            img_resized = resize_image(img, max_size)
+            img_resized = resize_image(img, tuple(map(int, max_size)))
             images.append(img_resized.copy())  # Copy to ensure the file is not left open
 
     # Create and save the GIF
@@ -54,7 +54,7 @@ def generate_gif_from_pics(
 
 
 def main(_):
-    generate_gif_from_pics(FLAGS.pic_dir, FLAGS.output_file, FLAGS.frame_duration, FLAGS.pic_suffix)
+    generate_gif_from_pics(FLAGS.pic_dir, FLAGS.output_file, FLAGS.frame_duration, FLAGS.pic_suffix, FLAGS.max_size, optimize=FLAGS.optimize)
 
 
 if __name__ == '__main__':
