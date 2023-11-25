@@ -1,14 +1,14 @@
 # Neural-Tree-Search
 Neural Tree Search for active slam
 
-## muax 😘
-Muax provides help for using DeepMind's [mctx](https://github.com/deepmind/mctx) on gym-style environments. 
+## acme-more-mcts
 
 ## Installation
-Muax is required to be installed for this project:
+fork [acme-more-mcts](https://github.com/bwfbowen/acme-more-mcts) and run following command from the main directory(where `setup.py` is located):
 ```sh
-pip install muax
+pip install .[jax,tf,testing,envs]
 ```
+
 
 Habitat is also needed:
 ```sh
@@ -39,16 +39,9 @@ Please download the data using the instructions here: https://github.com/faceboo
 ## Getting started
 To run the code:
 ```python
-python main.py
-```
-
-To use the trained model, specify the path to the model in `mini_args.py` `load_model`. For example,
-```
-load_model='/home/fangbowen/Neural-Tree-Search/tmp/models/nts4/model_best.npy'
+python run_acme.py
 ```
 
 ## Results
 
-![bst-nts4_eval_img2-1-2-30 2023-05-04 19_06_43](https://user-images.githubusercontent.com/104526323/236348674-c8bce570-650e-42f1-8df3-d9d2186ff1b4.gif)
-
-![cmpnts](https://user-images.githubusercontent.com/104526323/236352277-df5c63ff-2792-4dfc-8053-d50b91ea7650.png)
+![dis](https://github.com/bwfbowen/Neural-Tree-Search/assets/104526323/5bec0425-e6e9-401a-a391-6904bb9aac2b)
