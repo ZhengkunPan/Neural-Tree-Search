@@ -52,7 +52,7 @@ def main():
     pose_fn = _init_resnet_pose_func(PoseEstimator)
 
     discount = 0.997
-    gradient_transform = muax.model.optimizer(init_value=1e-3, peak_value=2e-3, end_value=1e-3, warmup_steps=5000, transition_steps=5000)
+    gradient_transform = muax.model.optimizer(init_value=1e-4, peak_value=1e-3, end_value=1e-5, warmup_steps=5000, transition_steps=5000)
 
     model = NTS(args,
                 dec_fn=dec_fn, 

@@ -243,7 +243,7 @@ def get_local_map_boundaries(agent_loc, local_sizes, full_sizes, args):
         if gy2 > full_h:
             gy1, gy2 = full_h - local_h, full_h
     else:
-        gx1.gx2, gy1, gy2 = 0, full_w, 0, full_h
+        gx1, gx2, gy1, gy2 = 0, full_w, 0, full_h
 
     return [gx1, gx2, gy1, gy2]
 

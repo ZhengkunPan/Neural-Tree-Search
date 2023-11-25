@@ -2,6 +2,7 @@ import math
 import os
 import pickle
 import sys
+import functools
 
 import gym
 import matplotlib
@@ -9,9 +10,14 @@ import numpy as np
 import quaternion
 import skimage.morphology
 import torch
+from torch import nn 
 from PIL import Image
 from torch.nn import functional as F
 from torchvision import transforms
+
+import dm_env
+from acme import specs
+
 
 if sys.platform == 'darwin':
     matplotlib.use("tkagg")
@@ -47,6 +53,117 @@ def _preprocess_depth(depth):
     return depth
 
 
+def action2goal(a: int, local_w: int, local_h: int, action_width: int , action_height: int):
+    global_goals = [
+        int((a % action_width + 0.5) / action_width * local_w),
+        int((a // action_width + 0.5) / action_height * local_h)
+        ] 
+    return global_goals
+
+
+def get_local_map_boundaries(agent_loc, local_sizes, full_sizes, args):
+    loc_r, loc_c = agent_loc
+    local_w, local_h = local_sizes
+    full_w, full_h = full_sizes
+
+    if args.global_downscaling > 1:
+        gx1, gy1 = loc_r - local_w // 2, loc_c - local_h // 2
+        gx2, gy2 = gx1 + local_w, gy1 + local_h
+        if gx1 < 0:
+            gx1, gx2 = 0, local_w
+        if gx2 > full_w:
+            gx1, gx2 = full_w - local_w, full_w
+
+        if gy1 < 0:
+            gy1, gy2 = 0, local_h
+        if gy2 > full_h:
+            gy1, gy2 = full_h - local_h, full_h
+    else:
+        gx1, gx2, gy1, gy2 = 0, full_w, 0, full_h
+
+    return [gx1, gx2, gy1, gy2]
+
+
+class ChannelPool(nn.MaxPool1d):
+    def forward(self, x):
+        n, c, w, h = x.size()
+        x = x.view(n, c, w * h).permute(0, 2, 1)
+        x = x.contiguous()
+        pooled = F.max_pool1d(x, c, 1)
+        _, _, c = pooled.size()
+        pooled = pooled.permute(0, 2, 1)
+        return pooled.view(n, c, w, h)
+    
+
+class MapAggregater(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self._args = args
+        self.device = 'cpu'
+        self.map_size_cm = args.map_size_cm // args.global_downscaling
+        self.vision_range = args.vision_range
+        self.resolution = args.map_resolution
+        self.agent_view = torch.zeros(1, 2, self.map_size_cm // self.resolution, self.map_size_cm // self.resolution).float().to(self.device)
+        self.pool = ChannelPool(1)
+    
+    def forward(self, fp_proj, fp_exp, poses, pose_pred, local_map, local_explored, current_poses):
+        with torch.no_grad():
+            agent_view = self.agent_view.detach_()
+            agent_view.fill_(0.)
+
+            x1 = self.map_size_cm // (self.resolution * 2) \
+                    - self.vision_range // 2
+            x2 = x1 + self.vision_range
+            y1 = self.map_size_cm // (self.resolution * 2)
+            y2 = y1 + self.vision_range
+            agent_view[:, :1, y1:y2, x1:x2] = torch.from_numpy(fp_proj)
+            agent_view[:, 1:, y1:y2, x1:x2] = torch.from_numpy(fp_exp)
+
+            corrected_pose = np.expand_dims(poses + pose_pred, axis=0)
+
+            def get_new_pose_batch(pose, rel_pose_change):
+                pose[:, 1] += rel_pose_change[:, 0] * \
+                                torch.sin(pose[:, 2] / 57.29577951308232) \
+                                + rel_pose_change[:, 1] * \
+                                torch.cos(pose[:, 2] / 57.29577951308232)
+                pose[:, 0] += rel_pose_change[:, 0] * \
+                                torch.cos(pose[:, 2] / 57.29577951308232) \
+                                - rel_pose_change[:, 1] * \
+                                torch.sin(pose[:, 2] / 57.29577951308232)
+                pose[:, 2] += rel_pose_change[:, 2] * 57.29577951308232
+
+                pose[:, 2] = torch.fmod(pose[:, 2] - 180.0, 360.0) + 180.0
+                pose[:, 2] = torch.fmod(pose[:, 2] + 180.0, 360.0) - 180.0
+
+                return pose
+
+            current_poses = get_new_pose_batch(torch.from_numpy(np.expand_dims(current_poses, axis=0)),
+                                                torch.from_numpy(corrected_pose))
+            st_pose = current_poses.clone().detach()
+
+            st_pose[:, :2] = - (st_pose[:, :2] * 100.0 / self.resolution
+                                - self.map_size_cm \
+                                // (self.resolution * 2)) \
+                                / (self.map_size_cm // (self.resolution * 2))
+            st_pose[:, 2] = 90. - (st_pose[:, 2])
+
+            rot_mat, trans_mat = get_grid(st_pose, agent_view.size(),
+                                            self.device)
+
+            rotated = F.grid_sample(agent_view, rot_mat, align_corners=True)
+            translated = F.grid_sample(rotated, trans_mat, align_corners=True)
+
+            maps, explored = torch.from_numpy(np.expand_dims(local_map, axis=0)), torch.from_numpy(np.expand_dims(local_explored, axis=0))
+            maps2 = torch.cat((maps.unsqueeze(1),
+                                translated[:, :1, :, :]), 1)
+            explored2 = torch.cat((explored.unsqueeze(1),
+                                    translated[:, 1:, :, :]), 1)
+            
+            map_pred = (self.pool(maps2).squeeze(1).squeeze(0)).numpy()
+            exp_pred = (self.pool(explored2).squeeze(1).squeeze(0)).numpy()
+        return map_pred, exp_pred
+
+
 class Exploration_Env(habitat.RLEnv):
 
     def __init__(self, args, rank, config_env, config_baseline, dataset):
@@ -58,6 +175,12 @@ class Exploration_Env(habitat.RLEnv):
                                                 num="Thread {}".format(rank))
 
         self.args = args
+
+        map_size = self.args.map_size_cm // self.args.map_resolution
+        self._full_w, self._full_h = map_size, map_size
+        self._local_w, self._local_h = int(self._full_w / self.args.global_downscaling), int(self._full_h / self.args.global_downscaling)
+        self._map_agg = MapAggregater(args)
+
         self.num_actions = 3
         self.dt = 10
 
@@ -69,10 +192,13 @@ class Exploration_Env(habitat.RLEnv):
                 pickle.load(open("noise_models/sensor_noise_right.pkl", 'rb'))
         self.sensor_noise_left = \
                 pickle.load(open("noise_models/sensor_noise_left.pkl", 'rb'))
-
-        habitat.SimulatorActions.extend_action_space("NOISY_FORWARD")
-        habitat.SimulatorActions.extend_action_space("NOISY_RIGHT")
-        habitat.SimulatorActions.extend_action_space("NOISY_LEFT")
+        
+        if not habitat.SimulatorActions.has_action("NOISY_FORWARD"):
+            habitat.SimulatorActions.extend_action_space("NOISY_FORWARD")
+        if not habitat.SimulatorActions.has_action("NOISY_RIGHT"):
+            habitat.SimulatorActions.extend_action_space("NOISY_RIGHT")
+        if not habitat.SimulatorActions.has_action("NOISY_LEFT"):
+            habitat.SimulatorActions.extend_action_space("NOISY_LEFT")
 
         config_env.defrost()
         config_env.SIMULATOR.ACTION_SPACE_CONFIG = \
@@ -84,10 +210,10 @@ class Exploration_Env(habitat.RLEnv):
 
         self.action_space = gym.spaces.Discrete(self.num_actions)
 
-        self.observation_space = gym.spaces.Box(0, 255,
+        self.observation_space = gym.spaces.Box(0, 1,
                                                 (3, args.frame_height,
                                                     args.frame_width),
-                                                dtype='uint8')
+                                                dtype='float32')
 
         self.mapper = self.build_mapper()
 
@@ -147,8 +273,8 @@ class Exploration_Env(habitat.RLEnv):
         rgb = obs['rgb'].astype(np.uint8)
         self.obs = rgb # For visualization
         if self.args.frame_width != self.args.env_frame_width:
-            rgb = np.asarray(self.res(rgb))
-        state = rgb.transpose(2, 0, 1)
+            rgb = (np.asarray(self.res(rgb)) / 255).astype('float32')
+        state = rgb
         depth = _preprocess_depth(obs['depth'])
 
         # Initialize map and pose
@@ -167,8 +293,8 @@ class Exploration_Env(habitat.RLEnv):
                           np.deg2rad(self.curr_loc_gt[2]))
 
         # Update ground_truth map and explored area
-        fp_proj, self.map, fp_explored, self.explored_map = \
-            self.mapper.update_map(depth, mapper_gt_pose)
+        fp_proj, self.map, fp_explored, self.explored_map = self.mapper.update_map(depth, mapper_gt_pose)
+        self._fp_proj, self._fp_explored = (fp_proj).astype('float32'), (fp_explored).astype('float32')
 
         # Initialize variables
         self.scene_name = self.habitat_env.sim.config.SCENE
@@ -178,15 +304,18 @@ class Exploration_Env(habitat.RLEnv):
         self.collison_map = np.zeros(self.map.shape)
         self.col_width = 1
 
+        self._pose = np.asarray([0., 0., 0.], dtype='float32')
+        self._pose_pred = np.asarray([0., 0., 0.], dtype='float32')
         # Set info
         self.info = {
             'time': self.timestep,
-            'fp_proj': fp_proj,
-            'fp_explored': fp_explored,
-            'sensor_pose': [0., 0., 0.],
-            'pose_err': [0., 0., 0.],
+            'fp_proj': self._fp_proj,
+            'fp_explored': self._fp_explored,
+            'sensor_pose': self._pose,
+            'pose_err': self._pose_pred,
+            'exp_reward': 0.,
+            'exp_ratio': 0.,
         }
-
         self.save_position()
 
         return state, self.info
@@ -220,9 +349,9 @@ class Exploration_Env(habitat.RLEnv):
         rgb = obs['rgb'].astype(np.uint8)
         self.obs = rgb # For visualization
         if self.args.frame_width != self.args.env_frame_width:
-            rgb = np.asarray(self.res(rgb))
+            rgb = (np.asarray(self.res(rgb)) / 255).astype('float32')
 
-        state = rgb.transpose(2, 0, 1)
+        state = rgb
 
         depth = _preprocess_depth(obs['depth'])
 
@@ -248,9 +377,8 @@ class Exploration_Env(habitat.RLEnv):
 
 
         # Update ground_truth map and explored area
-        fp_proj, self.map, fp_explored, self.explored_map = \
-                self.mapper.update_map(depth, mapper_gt_pose)
-
+        fp_proj, self.map, fp_explored, self.explored_map = self.mapper.update_map(depth, mapper_gt_pose)
+        self._fp_proj, self._fp_explored = (fp_proj).astype('float32'), (fp_explored).astype('float32')
 
         # Update collision map
         if action == 1:
@@ -280,23 +408,18 @@ class Exploration_Env(habitat.RLEnv):
                                     self.collison_map.shape)
                         self.collison_map[r,c] = 1
 
+        self._pose = np.asarray([dx_base, dy_base, do_base], dtype='float32')
+        self._pose_pred = np.asarray([dx_gt - dx_base, dy_gt - dy_base, do_gt - do_base], dtype='float32')
         # Set info
         self.info['time'] = self.timestep
-        self.info['fp_proj'] = fp_proj
-        self.info['fp_explored']= fp_explored
-        self.info['sensor_pose'] = [dx_base, dy_base, do_base]
-        self.info['pose_err'] = [dx_gt - dx_base,
-                                 dy_gt - dy_base,
-                                 do_gt - do_base]
+        self.info['fp_proj'] = self._fp_proj
+        self.info['fp_explored']= self._fp_explored
+        self.info['sensor_pose'] = self._pose
+        self.info['pose_err'] = self._pose_pred 
 
-
-        if self.timestep%args.num_local_steps==0:
-            area, ratio = self.get_global_reward()
-            self.info['exp_reward'] = area
-            self.info['exp_ratio'] = ratio
-        else:
-            self.info['exp_reward'] = None
-            self.info['exp_ratio'] = None
+        area, ratio = self.get_global_reward()
+        rew = self.info['exp_reward'] = area
+        self.info['exp_ratio'] = ratio
 
         self.save_position()
 
@@ -406,21 +529,31 @@ class Exploration_Env(habitat.RLEnv):
 
 
     def get_short_term_goal(self, inputs):
-
+        
         args = self.args
 
+        # Get pose prediction and global policy planning window
+        start_x, start_y, start_o = self.curr_loc_gt
+        r, c = start_y, start_x
+        agent_loc = [int(r * 100.0/args.map_resolution),
+                      int(c * 100.0/args.map_resolution)]
+        
+        gx1, gx2, gy1, gy2 = inputs['pose_pred'] if 'pose_pred' in inputs else get_local_map_boundaries(agent_loc, (self._local_w, self._local_h), (self._full_w, self._full_h), args)
+        
         # Get Map prediction
-        map_pred = inputs['map_pred']
-        exp_pred = inputs['exp_pred']
+        if 'map_pred' not in inputs or 'exp_pred' not in inputs:
+            local_map, local_explored, cur_pose = self.map[gx1:gx2, gy1:gy2], self.explored_map[gx1:gx2, gy1:gy2], np.asarray(self.curr_loc_gt)
+            map_pred, exp_pred = self._map_agg(self._fp_proj, self._fp_explored, self._pose, self._pose_pred, local_map, local_explored, cur_pose)
+        else:
+            map_pred = inputs['map_pred']
+            exp_pred = inputs['exp_pred'] 
 
         grid = np.rint(map_pred)
         explored = np.rint(exp_pred)
-
-        # Get pose prediction and global policy planning window
-        start_x, start_y, start_o, gx1, gx2, gy1, gy2 = inputs['pose_pred']
+        
         gx1, gx2, gy1, gy2 = int(gx1), int(gx2), int(gy1), int(gy2)
         planning_window = [gx1, gx2, gy1, gy2]
-
+        
         # Get last loc
         last_start_x, last_start_y = self.last_loc[0], self.last_loc[1]
         r, c = last_start_y, last_start_x
@@ -439,7 +572,7 @@ class Exploration_Env(habitat.RLEnv):
         self.visited[gx1:gx2, gy1:gy2][start[0]-2:start[0]+3,
                                        start[1]-2:start[1]+3] = 1
 
-        steps = 25
+        steps = args.num_local_steps
         for i in range(steps):
             x = int(last_start[0] + (start[0] - last_start[0]) * (i+1) / steps)
             y = int(last_start[1] + (start[1] - last_start[1]) * (i+1) / steps)
@@ -460,7 +593,7 @@ class Exploration_Env(habitat.RLEnv):
         start_gt = pu.threshold_poses(start_gt, self.visited_gt.shape)
         #self.visited_gt[start_gt[0], start_gt[1]] = 1
 
-        steps = 25
+        steps = args.num_local_steps
         for i in range(steps):
             x = int(last_start[0] + (start_gt[0] - last_start[0]) * (i+1) / steps)
             y = int(last_start[1] + (start_gt[1] - last_start[1]) * (i+1) / steps)
@@ -553,7 +686,7 @@ class Exploration_Env(habitat.RLEnv):
                              start_o_gt),
                             dump_dir, self.rank, self.episode_no,
                             self.timestep, args.visualize,
-                            args.print_images)
+                            args.print_images, args.vis_type)
 
             else: # Visualize ground-truth map and pose
                 vis_grid = vu.get_colored_map(self.map,
@@ -571,7 +704,7 @@ class Exploration_Env(habitat.RLEnv):
                             (start_x_gt, start_y_gt, start_o_gt),
                             dump_dir, self.rank, self.episode_no,
                             self.timestep, args.visualize,
-                            args.print_images)
+                            args.print_images, vis_style=0)
 
         return output
 
@@ -628,8 +761,10 @@ class Exploration_Env(habitat.RLEnv):
 
         grid_map = torch.from_numpy(grid_map).float()
         grid_map = grid_map.unsqueeze(0).unsqueeze(0)
-        translated = F.grid_sample(grid_map, trans_mat)
-        rotated = F.grid_sample(translated, rot_mat)
+        # Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. 
+        # specify align_corners=True if the old behavior is desired.
+        translated = F.grid_sample(grid_map, trans_mat, align_corners=True) 
+        rotated = F.grid_sample(translated, rot_mat, align_corners=True)
 
         episode_map = torch.zeros((full_map_size, full_map_size)).float()
         if full_map_size > grid_size:
@@ -794,3 +929,84 @@ class Exploration_Env(habitat.RLEnv):
             gt_action = 2
 
         return gt_action
+
+class DMExploration(Exploration_Env):
+    # TODO: accept map action as input, compute local actions
+    def __init__(self, args, rank, config_env, config_baseline, dataset):
+        super().__init__(args, rank, config_env, config_baseline, dataset)
+        self.num_actions = int(self.args.action_width * self.args.action_height)
+        self._rgb_dim = np.prod((self.args.frame_height, self.args.frame_width, 3))
+        self._fp_proj_dim = self._fp_explored_dim = np.prod((self.args.vision_range, self.args.vision_range))
+        self._sensor_pose_dim = self._pose_err_dim = 3 
+        self._exp_reward_dim = self._exp_ratio_dim = 1
+        self._init_pos()
+        self.observation_space = self.observation_spec()
+        self._obs = np.zeros(self.observation_space.shape, dtype=self.observation_space.dtype)
+        self._reset_next_step = True
+
+        self._action2goal = functools.partial(action2goal, local_h=self._local_h, local_w=self._local_w, action_height=self.args.action_height, action_width=self.args.action_width)
+
+    def reset(self):
+        self._reset_next_step = False
+        state, self.info = super().reset()
+        observation = self._observe(state, self.info)
+        return dm_env.restart(observation)
+
+    def step(self, action):
+        if self._reset_next_step:
+            return self.reset()
+        # from map location to robot movement
+        map_goal = self._action2goal(action)
+        reward = 0.
+        for step in range(self.args.num_local_steps): 
+            _, _, a = self.get_short_term_goal({'goal': map_goal})
+            state, rew, done, self.info = super().step(a)
+            reward += rew
+            observation = self._observe(state, self.info)
+            if done: 
+                self._reset_next_step = True 
+                return dm_env.termination(reward=reward, observation=observation)
+        else:
+            return dm_env.transition(reward=reward, observation=observation, discount=self.args.discount)
+        
+    def observation_spec(self):
+        total_dim = self._rgb_dim + self._fp_proj_dim + self._fp_explored_dim  + self._sensor_pose_dim + self._pose_err_dim + self._exp_reward_dim + self._exp_ratio_dim
+        observation_space = specs.BoundedArray((total_dim,), dtype='float32', minimum=0., maximum=1.)
+        # {'state': specs.BoundedArray((self.args.frame_height, self.args.frame_width, 3), dtype='float32', minimum=0., maximum=1., name='normalized RGB'),
+        #                      'info': {'time': specs.Array((),dtype=int),
+        #                               'fp_proj': specs.BoundedArray((self.args.vision_range, self.args.vision_range), dtype='float32', minimum=0., maximum=1.),
+        #                               'fp_explored': specs.BoundedArray((self.args.vision_range, self.args.vision_range), dtype='float32', minimum=0., maximum=1.),
+        #                               'sensor_pose': specs.BoundedArray((3,), dtype='float32', minimum=0., maximum=1.),
+        #                               'pose_err': specs.BoundedArray((3,), dtype='float32', minimum=0., maximum=1.),
+        #                               'exp_reward': specs.Array((),dtype=float),
+        #                               'exp_ratio': specs.Array((),dtype=float),
+        #                               }}
+        return observation_space
+    
+    def action_spec(self):
+        action_space = specs.DiscreteArray(dtype='int32', num_values=self.num_actions, name='action')
+        return action_space
+        
+    def reward_spec(self):
+        return specs.Array((), dtype='float32')
+    
+    def discount_spec(self):
+        return specs.Array((), dtype='float32')
+    
+    def _observe(self, state, info):
+        self._obs[:self._rgb_dim] = state.flatten()
+        self._obs[self._rgb_dim: self._p1] = info['fp_proj'].flatten()
+        self._obs[self._p1: self._p2] = info['fp_explored'].flatten()
+        self._obs[self._p2: self._p3] = info['sensor_pose'].flatten()
+        self._obs[self._p3: self._p4] = info['pose_err'].flatten()
+        self._obs[self._p4: self._p5] = info['exp_reward']
+        self._obs[self._p5: self._p6] = info['exp_ratio']
+        return self._obs 
+    
+    def _init_pos(self):
+        self._p1 = self._rgb_dim + self._fp_proj_dim
+        self._p2 = self._p1 + self._fp_explored_dim
+        self._p3 = self._p2 + self._sensor_pose_dim
+        self._p4 = self._p3 + self._pose_err_dim
+        self._p5 = self._p4 + self._exp_reward_dim
+        self._p6 = self._p5 + self._exp_ratio_dim

@@ -12,9 +12,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import skimage
 
-
 def visualize(fig, ax, img, grid, pos, gt_pos, dump_dir, rank, ep_no, t,
-              visualize, print_images):
+              visualize, print_images, vis_style=1):
     for i in range(2):
         ax[i].clear()
         ax[i].set_yticks([])
@@ -23,14 +22,15 @@ def visualize(fig, ax, img, grid, pos, gt_pos, dump_dir, rank, ep_no, t,
         ax[i].set_xticklabels([])
 
     ax[0].imshow(img)
-    ax[0].set_title("Observation", fontsize=20)
+    ax[0].set_title("Observation", family='sans-serif', fontsize=20)
 
-    
-    title = "Predicted Map and Pose"
-    
+    if vis_style == 1:
+        title = "Predicted Map and Pose"
+    else:
+        title = "Ground-Truth Map and Pose"
 
     ax[1].imshow(grid)
-    ax[1].set_title(title, fontsize=20)
+    ax[1].set_title(title, family='sans-serif', fontsize=20)
 
     # Draw GT agent pose
     agent_size = 8
