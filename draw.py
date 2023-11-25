@@ -9,6 +9,8 @@ flags.DEFINE_string('pic_dir', "~/tmp/dump/nts_eval_img/episodes/1/1", 'task con
 flags.DEFINE_string('output_file', '~/tmp/dump/nav.gif', 'output file')
 flags.DEFINE_integer('frame_duration', 50, 'frame duration')
 flags.DEFINE_string('pic_suffix', '.png', 'pic suffix')
+flags.DEFINE_list('max_size', [100,100], 'max size')
+flags.DEFINE_boolean('optimize', True, 'whether to optimize')
 
 FLAGS = flags.FLAGS
 
@@ -20,12 +22,18 @@ def sorting_key(filename):
     return 0  # Default if the pattern is not found
 
 
+def resize_image(image, max_size):
+    return image.resize(max_size, Image.LANCZOS)
+
+
 def generate_gif_from_pics(
         pic_dir: str,
         output_file: str,
         frame_duration: int = 500,
         pic_suffix: str = '.png',
+        max_size: tuple = (100, 100),
         sort_fn: callable = sorting_key,
+        optimize: bool = True,
     ):
     # Sort the file names
     pic_dir = os.path.expanduser(pic_dir)
@@ -34,20 +42,15 @@ def generate_gif_from_pics(
     # Create a list to hold the images
     images = []
 
-    # Load the first image to determine size
-    with Image.open(file_names[0]) as img:
-        img_size = img.size
-
     # Load each file, resize if necessary, and append to images list
     for file_name in file_names:
         with Image.open(file_name) as img:
-            if img.size != img_size:
-                img = img.resize(img_size)
-            images.append(img.copy())  # Copy to ensure the file is not left open
+            img_resized = resize_image(img, max_size)
+            images.append(img_resized.copy())  # Copy to ensure the file is not left open
 
     # Create and save the GIF
     gif_path = os.path.expanduser(output_file)
-    images[0].save(gif_path, save_all=True, append_images=images[1:], optimize=False, duration=frame_duration, loop=0)
+    images[0].save(gif_path, save_all=True, append_images=images[1:], optimize=optimize, duration=frame_duration, loop=0)
 
 
 def main(_):
