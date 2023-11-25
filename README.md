@@ -44,4 +44,4 @@ python run_acme.py
 
 ## Results
 
-![dis](https://github.com/bwfbowen/Neural-Tree-Search/assets/104526323/5bec0425-e6e9-401a-a391-6904bb9aac2b)
+<img src="https://github.com/bwfbowen/Neural-Tree-Search/assets/104526323/5bec0425-e6e9-401a-a391-6904bb9aac2b" alt="drawing" width="300"/>
